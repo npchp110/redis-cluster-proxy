@@ -58,6 +58,10 @@ typedef struct clientRequest{
     size_t written;
     int parsing_status;
     int has_write_handler;
+    list *child_requests;
+    rax  *child_replies;
+    uint64_t max_child_reply_id;
+    struct clientRequest *parent_request;
 } clientRequest;
 
 typedef struct {
