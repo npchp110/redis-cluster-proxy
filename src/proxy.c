@@ -1614,7 +1614,8 @@ static int duplicateRequestForAllMasters(clientRequest *req) {
     /* TODO: use private slots_map if multiplexing is disabled. */
     listIter li;
     listNode *ln;
-    listRewind(proxy.cluster->nodes, &li);
+    redisCluster *cluster = getCluster(req->client->thread_id);
+    listRewind(cluster->nodes, &li);
     clientRequest *cur = req->client->current_request;
     while ((ln = listNext(&li)) != NULL) {
         clusterNode *node = ln->value;
@@ -2147,7 +2148,7 @@ static int processRequest(clientRequest *req) {
             clientRequest *r = ln->value;
             if (!enqueueRequestToSend(r)) goto invalid_request;
             if (r->node != last_node) {
-                handleNextRequestToCluster(r->node, r->client->thread_id);
+                handleNextRequestToCluster(r->node);
                 last_node = r->node;
             }
         }
