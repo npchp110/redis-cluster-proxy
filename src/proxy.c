@@ -55,7 +55,8 @@
 
 #define UNUSED(V) ((void) V)
 
-#define getCluster(thread_id) (proxy.threads[thread_id]->cluster)
+#define getCluster(c) \
+    (c->cluster ? c->cluster : proxy.threads[c->thread_id]->cluster)
 #define enqueueRequestToSend(req) (enqueueRequest(req, QUEUE_TYPE_SENDING))
 #define dequeueRequestToSend(req) (dequeueRequest(req, QUEUE_TYPE_SENDING))
 #define enqueuePendingRequest(req) (enqueueRequest(req, QUEUE_TYPE_PENDING))
@@ -104,6 +105,7 @@ static void dequeueRequest(clientRequest *req, int queue_type);
 static int sendMessageToThread(proxyThread *thread, sds buf);
 static int installIOHandler(aeEventLoop *el, int fd, int mask, aeFileProc *proc,
                             void *data, int retried);
+static int disableMultiplexingForClient(client *c);
 
 /* Hiredis helpers */
 
@@ -309,6 +311,25 @@ int proxyCommand(void *r) {
         }
         sdsfree(option);
         if (value != NULL) sdsfree(value);
+    } else if (strcasecmp("multiplexing", subcmd) == 0) {
+        assert(req->offsets_size >= 3);
+        offset = req->offsets[2];
+        len = req->lengths[2];
+        p = req->buffer + offset, end = req->buffer + buflen;
+        assert(p < end);
+        assert((p + len) < end);
+        sds action = sdsnewlen(p, len);
+        if (strcasecmp("status", action) == 0) {
+            char *status = (req->client->cluster != NULL ? "off" : "on");
+            addReplyString(req->client, status, req->id);
+        } else if (strcasecmp("off", action) == 0) {
+            if (disableMultiplexingForClient(req->client))
+                addReplyString(req->client, "OK", req->id);
+            else
+                err = sdsnew("Failed to disable multiplexing");
+        } else
+            err = sdsnew("Unsupported action. Supported actions: status|off");
+        sdsfree(action);
     } else if (strcasecmp("ping", subcmd) == 0) {
         addReplyString(req->client, "PONG", req->id);
     } else {
@@ -386,26 +407,28 @@ static int parseAddress(char *address, char **ip, int *port, char **hostsocket)
 
 static void printHelp(void) {
     fprintf(stderr, "Usage: redis-cluster-proxy [OPTIONS] "
-            "cluster_host:cluster_port\n"
-            "  -p, --port <port>    Port (default: %d)\n"
-            "  --max-clients <n>    Max clients (default: %d)\n"
-            "  --threads <n>        Thread number (default: %d, max: %d)\n"
-            "  --tcpkeepalive       TCP Keep Alive (default: %d)\n"
-            "  --tcp-backlog        TCP Backlog (default: %d)\n"
-            "  --daemonize          Execute the proxy in background\n"
-            "  -a, --auth <passw>   Authentication password\n"
-            "  --disable-colors     Disable colorized output\n"
-            "  --log-level <level>  Minimum log level: (default: info)\n"
-            "                       (debug|info|success|warning|error)\n"
-            "  --dump-queries       Dump query args (only for log-level "
-                                    "'debug') \n"
-            "  --dump-buffer        Dump query buffer (only for log-level "
-                                    "'debug') \n"
-            "  --dump-queues        Dump request queues (only for log-level "
-                                    "'debug') \n"
-            "  -h, --help         Print this help\n",
-            DEFAULT_PORT, DEFAULT_MAX_CLIENTS, DEFAULT_THREADS, MAX_THREADS,
-            DEFAULT_TCP_KEEPALIVE, DEFAULT_TCP_BACKLOG);
+        "cluster_host:cluster_port\n"
+        "  -p, --port <port>    Port (default: %d)\n"
+        "  --max-clients <n>    Max clients (default: %d)\n"
+        "  --threads <n>        Thread number (default: %d, max: %d)\n"
+        "  --tcpkeepalive       TCP Keep Alive (default: %d)\n"
+        "  --tcp-backlog        TCP Backlog (default: %d)\n"
+        "  --daemonize          Execute the proxy in background\n"
+        "  --disable-multiplexing <opt> When should multiplexing disabled\n"
+        "                               (never|auto|always) (default: auto)\n"
+        "  -a, --auth <passw>   Authentication password\n"
+        "  --disable-colors     Disable colorized output\n"
+        "  --log-level <level>  Minimum log level: (default: info)\n"
+        "                       (debug|info|success|warning|error)\n"
+        "  --dump-queries       Dump query args (only for log-level "
+                                "'debug') \n"
+        "  --dump-buffer        Dump query buffer (only for log-level "
+                                "'debug') \n"
+        "  --dump-queues        Dump request queues (only for log-level "
+                                "'debug') \n"
+        "  -h, --help         Print this help\n",
+        DEFAULT_PORT, DEFAULT_MAX_CLIENTS, DEFAULT_THREADS, MAX_THREADS,
+        DEFAULT_TCP_KEEPALIVE, DEFAULT_TCP_BACKLOG);
 }
 
 static int parseOptions(int argc, char **argv) {
@@ -459,6 +482,19 @@ static int parseOptions(int argc, char **argv) {
                 exit(1);
             }
             config.loglevel = level;
+        } else if (!strcmp("--disable-multiplexing", arg) && !lastarg) {
+            char *val = argv[++i];
+            if (!strcasecmp("never", val))
+                config.disable_multiplexing = CFG_DISABLE_MULTIPLEXING_NEVER;
+            else if (!strcasecmp("always", val))
+                config.disable_multiplexing = CFG_DISABLE_MULTIPLEXING_ALWAYS;
+            else if (!strcasecmp("auto", val))
+                config.disable_multiplexing = CFG_DISABLE_MULTIPLEXING_AUTO;
+            else {
+                fprintf(stderr, "Invalid option for --disable-multiplexing, "
+                        "valid options are:\nnever|auto|always\n");
+                exit(1);
+            }
         } else if (!strcmp("--help", arg)) {
             printHelp();
             exit(0);
@@ -693,6 +729,7 @@ void beforeThreadSleep(struct aeEventLoop *eventLoop) {
         clusterNode *node = ln->value;
         handleNextRequestToCluster(node);
     }
+    /* TODO: Also flush private clusters' requests. */
 }
 
 static int processThreadPipeBufferForNewClients(proxyThread *thread) {
@@ -936,6 +973,7 @@ static client *createClient(int fd, char *ip) {
     c->obuf = sdsempty();
     c->reply_array = NULL;
     c->current_request = NULL;
+    c->cluster = NULL;
     anetNonBlock(NULL, fd);
     anetEnableTcpNoDelay(NULL, fd);
     if (config.tcpkeepalive)
@@ -949,7 +987,68 @@ static client *createClient(int fd, char *ip) {
     c->next_request_id = 0;
     c->min_reply_id = 0;
     c->requests_with_write_handler = 0;
+    c->pending_multiplex_requests = 0;
+    if (config.disable_multiplexing == CFG_DISABLE_MULTIPLEXING_ALWAYS) {
+        if (!disableMultiplexingForClient(c)) {
+            freeClient(c);
+            return NULL;
+        }
+    }
     return c;
+}
+
+/* Disable multiplexing on the specified client by creating a private
+ * slots map (radix tree) on the client itself. The slots map will be
+ * a duplicate of the shared map (proxy.cluster->slots_map), and every
+ * node in the map will be a duplicate of the shared map's corresponding
+ * node, but the duplicated node will have the cluster member set to
+ * NULL, so that it will have just one connection (redisClusterConnection *).
+ * This connection will give client a private socket to the node and private
+ * request queues. */
+static int disableMultiplexingForClient(client *c) {
+    if (c->cluster != NULL) return 1;
+    proxyLogDebug("Disabling multiplexing for client %llu\n", c->id);
+    proxyThread *thread = proxy.threads[c->thread_id];
+    c->cluster = duplicateCluster(thread->cluster);
+    if (c->cluster == NULL) return 0;
+    c->cluster->owner = c;
+    listIter li;
+    listNode *ln;
+    listRewind(c->cluster->nodes, &li);
+    while ((ln = listNext(&li))) {
+        clusterNode *node = (clusterNode *) ln->value;
+        clusterNode *source = node->duplicated_from;
+        assert(source != NULL);
+        redisClusterConnection *conn = source->connection;
+
+        /* Move requests from shared connection to private connection. */
+        listIter rli;
+        listNode *rln;
+        listRewind(conn->requests_to_send, &rli);
+        while ((rln = listNext(&rli))) {
+            clientRequest *req = rln->value;
+            if (req->client != c) continue;
+            if (req->has_write_handler) {
+                c->pending_multiplex_requests++;
+                continue;
+            }
+            /* Replace request node with duplicated node owned by the client */
+            req->node = node;
+            listAddNodeTail(node->connection->requests_to_send, req);
+            listDelNode(conn->requests_to_send, ln);
+            req->owned_by_client = 1;
+        }
+        if (c->pending_multiplex_requests == 0) {
+            listRewind(conn->requests_pending, &rli);
+            while ((rln = listNext(&rli))) {
+                clientRequest *req = rln->value;
+                if (req->client == c) c->pending_multiplex_requests++;
+            }
+        }
+        if (c->pending_multiplex_requests == 0)
+            handleNextRequestToCluster(node);
+    }
+    return 1;
 }
 
 static void unlinkClient(client *c) {
@@ -967,7 +1066,7 @@ static void unlinkClient(client *c) {
 static void freeAllClientRequests(client *c) {
     listIter li;
     listNode *ln;
-    redisCluster *cluster = getCluster(c->thread_id);
+    redisCluster *cluster = getCluster(c);
     listRewind(cluster->nodes, &li);
     while ((ln = listNext(&li))) {
         clusterNode *node = ln->value;
@@ -1032,6 +1131,7 @@ static void freeClient(client *c) {
     freeAllClientRequests(c);
     if (c->unordered_replies)
         raxFreeWithCallback(c->unordered_replies, (void (*)(void*))sdsfree);
+    if (c->cluster != NULL) freeCluster(c->cluster);
     zfree(c);
     proxy.numclients--;
 }
@@ -1462,7 +1562,7 @@ static sds getRequestCommand(clientRequest *req) {
 
 static clusterNode *getRequestNode(clientRequest *req, sds *err) {
     clusterNode *node = NULL;
-    redisCluster *cluster = getCluster(req->client->thread_id);
+    redisCluster *cluster = getCluster(req->client);
     int slot = UNDEFINED_SLOT;
     if (req->argc == 1) {
         /*TODO: temporary behaviour */
@@ -1609,6 +1709,7 @@ static clientRequest *createRequest(client *c) {
     req->current_bulk_length = REQ_STATUS_UNKNOWN;
     req->parsing_status = PARSE_STATUS_INCOMPLETE;
     req->has_write_handler = 0;
+    req->owned_by_client = 0;
     req->written = 0;
     size_t offsets_size = sizeof(int) * QUERY_OFFSETS_MIN_SIZE;
     req->offsets = zmalloc(offsets_size);
@@ -1625,7 +1726,7 @@ static clientRequest *createRequest(client *c) {
     /* TODO: this could lead to issues in reply sequencing */
     if (c->next_request_id >= UINT64_MAX)
         c->next_request_id = 0;
-
+    req->owned_by_client = (c->cluster != NULL);
     proxyLogDebug("Created Request %llu:%llu\n", req->client->id, req->id);
     return req;
 alloc_failure:
@@ -1754,6 +1855,22 @@ static clientRequest *handleNextRequestToCluster(clusterNode *node) {
     return req;
 }
 
+/* Check whether a client with private connection (multiplexing disabled) still
+ * has pending requests in the multiplexed context. After all peinding requests
+ * have been consumed, start sending requests to the private connection. */
+static void checkForMultiplexingRequestsToBeConsumed(clientRequest *req) {
+    if (req->client->cluster != NULL && !req->owned_by_client) {
+        if (--req->client->pending_multiplex_requests <= 0) {
+            listIter li;
+            listNode *ln;
+            listRewind(req->client->cluster->nodes, &li);
+            while ((ln = listNext(&li))) {
+                clusterNode *node = ln->value;
+                handleNextRequestToCluster(node);
+            }
+        }
+    }
+}
 
 static int processRequest(clientRequest *req) {
     int status = parseRequest(req);
@@ -2008,6 +2125,9 @@ static void readClusterReply(aeEventLoop *el, int fd,
         if (req != NULL) {
             dequeuePendingRequest(req);
             addReplyError(req->client, errmsg, req->id);
+            client *c = req->client;
+            if (c->cluster && c->pending_multiplex_requests > 0)
+                checkForMultiplexingRequestsToBeConsumed(req);
             freeRequest(req, 1);
         } else {
             listNode *first = listFirst(queue);
